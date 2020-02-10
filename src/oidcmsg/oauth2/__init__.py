@@ -1,8 +1,10 @@
 import inspect
 import logging
+import string
 import sys
 
-
+from oidcmsg import verified_claim_name
+from oidcmsg.exception import MissingAttribute
 from oidcmsg.exception import VerificationError
 from oidcmsg.message import Message
 from oidcmsg.message import OPTIONAL_LIST_OF_SP_SEP_STRINGS
@@ -10,8 +12,10 @@ from oidcmsg.message import OPTIONAL_LIST_OF_STRINGS
 from oidcmsg.message import REQUIRED_LIST_OF_SP_SEP_STRINGS
 from oidcmsg.message import REQUIRED_LIST_OF_STRINGS
 from oidcmsg.message import SINGLE_OPTIONAL_INT
+from oidcmsg.message import SINGLE_OPTIONAL_JSON
 from oidcmsg.message import SINGLE_OPTIONAL_STRING
 from oidcmsg.message import SINGLE_REQUIRED_BOOLEAN
+from oidcmsg.message import SINGLE_REQUIRED_INT
 from oidcmsg.message import SINGLE_REQUIRED_STRING
 
 logger = logging.getLogger(__name__)
@@ -24,13 +28,27 @@ def is_error_message(msg):
         return False
 
 
+error_chars = set(string.ascii_uppercase + string.ascii_lowercase + " " + "!")
+
+
 class ResponseMessage(Message):
     """
     The basic error response
     """
-    c_param = {"error": SINGLE_OPTIONAL_STRING,
-               "error_description": SINGLE_OPTIONAL_STRING,
-               "error_uri": SINGLE_OPTIONAL_STRING}
+    c_param = {
+        "error": SINGLE_OPTIONAL_STRING,
+        "error_description": SINGLE_OPTIONAL_STRING,
+        "error_uri": SINGLE_OPTIONAL_STRING
+    }
+
+    def verify(self, **kwargs):
+        super(ResponseMessage, self).verify(**kwargs)
+        if "error_description" in self:
+            # Verify that the characters used are within the allow ranges
+            # %x20-21 / %x23-5B / %x5D-7E
+            if not all(x in error_chars for x in self["error_description"]):
+                raise ValueError("Characters outside allowed set")
+        return True
 
 
 class AuthorizationErrorResponse(ResponseMessage):
@@ -40,22 +58,26 @@ class AuthorizationErrorResponse(ResponseMessage):
     c_param = ResponseMessage.c_param.copy()
     c_param.update({"state": SINGLE_OPTIONAL_STRING})
     c_allowed_values = ResponseMessage.c_allowed_values.copy()
-    c_allowed_values.update({"error": ["invalid_request",
-                                       "unauthorized_client",
-                                       "access_denied",
-                                       "unsupported_response_type",
-                                       "invalid_scope", "server_error",
-                                       "temporarily_unavailable"]})
+    c_allowed_values.update({
+        "error": ["invalid_request",
+                  "unauthorized_client",
+                  "access_denied",
+                  "unsupported_response_type",
+                  "invalid_scope", "server_error",
+                  "temporarily_unavailable"]
+    })
 
 
 class TokenErrorResponse(ResponseMessage):
     """
     Error response from the token endpoint
     """
-    c_allowed_values = {"error": ["invalid_request", "invalid_client",
-                                  "invalid_grant", "unauthorized_client",
-                                  "unsupported_grant_type",
-                                  "invalid_scope"]}
+    c_allowed_values = {
+        "error": ["invalid_request", "invalid_client",
+                  "invalid_grant", "unauthorized_client",
+                  "unsupported_grant_type",
+                  "invalid_scope"]
+    }
 
 
 class AccessTokenRequest(Message):
@@ -84,6 +106,34 @@ class AuthorizationRequest(Message):
         "redirect_uri": SINGLE_OPTIONAL_STRING,
         "state": SINGLE_OPTIONAL_STRING,
     }
+
+    def merge(self, request_object, treatement="strict", whitelist=None):
+        """
+        How to combine parameter that appear in the request with parameters that
+        appear in the request object.
+
+        :param request: The original request
+        :param request_object: The result of parsing the request/request_uri parameter
+        :param treatement: How to do the merge strict/lax/whitelist
+        :param whitelist: If whitelisted parameters from the request should be included in the
+            result, this is the list to use.
+        """
+
+        if treatement == 'strict':
+            params = list(self.keys())
+            # remove all parameters in request that does not appear in request_object
+            for param in params:
+                if param not in request_object:
+                    del self[param]
+        elif treatement == "lax":
+            pass
+        elif treatement == "whitelist" and whitelist:
+            params = list(self.keys())
+            for param in params:
+                if param not in whitelist:
+                    del self[param]
+
+        self.update(request_object)
 
 
 class AuthorizationResponse(ResponseMessage):
@@ -242,6 +292,77 @@ class TokenIntrospectionResponse(Message):
         "aud": OPTIONAL_LIST_OF_STRINGS,
         "iss": SINGLE_OPTIONAL_STRING,
         "jti": SINGLE_OPTIONAL_STRING,
+    }
+
+
+class JWTSecuredAuthorizationRequest(AuthorizationRequest):
+    c_param = AuthorizationRequest.c_param.copy()
+    c_param.update({
+        "request": SINGLE_OPTIONAL_STRING,
+        "request_uri": SINGLE_OPTIONAL_STRING
+    })
+
+    def verify(self, **kwargs):
+        if "request" in self:
+            _vc_name = verified_claim_name("request")
+            if _vc_name in self:
+                del self[_vc_name]
+
+            args = {}
+            for arg in ["keyjar", "opponent_id", "sender", "alg", "encalg",
+                        "encenc"]:
+                try:
+                    args[arg] = kwargs[arg]
+                except KeyError:
+                    pass
+
+            _req = AuthorizationRequest().from_jwt(str(self["request"]), **args)
+            self.merge(_req, 'strict')
+            self[_vc_name] = _req
+        elif "request_uri" not in self:
+            raise MissingAttribute("One of request or request_uri must be present")
+
+        return True
+
+
+class PushedAuthorizationRequest(AuthorizationRequest):
+    c_param = AuthorizationRequest.c_param.copy()
+    c_param.update({
+        "request": SINGLE_OPTIONAL_STRING
+    })
+
+    def verify(self, **kwargs):
+        if "request" in self:
+            _vc_name = verified_claim_name("request")
+            if _vc_name in self:
+                del self[_vc_name]
+
+            args = {}
+            for arg in ["keyjar", "opponent_id", "sender", "alg", "encalg",
+                        "encenc"]:
+                try:
+                    args[arg] = kwargs[arg]
+                except KeyError:
+                    pass
+
+            _req = AuthorizationRequest().from_jwt(str(self["request"]), **args)
+            self.merge(_req, "lax")
+            self[_vc_name] = _req
+
+        return True
+
+
+class SecurityEventToken(Message):
+    c_param = {
+        "iss": SINGLE_REQUIRED_STRING,
+        "iat": SINGLE_REQUIRED_INT,
+        "jti": SINGLE_REQUIRED_STRING,
+        "aud": OPTIONAL_LIST_OF_STRINGS,
+        "sub": SINGLE_OPTIONAL_STRING,
+        "exp": SINGLE_OPTIONAL_INT,
+        "events": SINGLE_OPTIONAL_JSON,
+        "txt": SINGLE_OPTIONAL_STRING,
+        "toe": SINGLE_OPTIONAL_INT
     }
 
 
