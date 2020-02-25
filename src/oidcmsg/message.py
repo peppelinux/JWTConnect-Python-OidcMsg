@@ -35,8 +35,11 @@ class Message(MutableMapping):
     c_default = {}
     c_allowed_values = {}
 
-    def __init__(self, **kwargs):
-        self._dict = self.c_default.copy()
+    def __init__(self, set_defaults=True, **kwargs):
+        if set_defaults:
+            self._dict = self.c_default.copy()
+        else:
+            self._dict = {}
         self.lax = False
         self.jwt = None
         self.jws_header = None
@@ -73,7 +76,7 @@ class Message(MutableMapping):
         Based on specification set a parameters value to the default value.
         """
         for key, val in self.c_default.items():
-            self._dict[key] = val
+            self._dict.setdefault(key, val)
 
     def to_urlencoded(self, lev=0):
         """
@@ -338,6 +341,12 @@ class Message(MutableMapping):
             vtyp = vtyp[0]
 
         if isinstance(vtyp, list):
+            if val is None:
+                if null_allowed:
+                    self._dict[key] = val
+                    return
+                raise ValueError("Null is not allowed")
+
             vtype = vtyp[0]
             if isinstance(val, vtype):
                 if issubclass(vtype, Message):
@@ -824,6 +833,18 @@ class Message(MutableMapping):
         """
         return [p for p, s in self.c_param.items() if s[1] is True]
 
+    def value_type(self, parameter):
+        """
+        Return the type of value that a parameter can have.
+
+        :param parameter: Name of the parameter
+        :return: Type of Value or None if unknown.
+        """
+        _spec = self.c_param.get(parameter)
+        if _spec:
+            return _spec[0]
+
+        return None
 
 # =============================================================================
 
